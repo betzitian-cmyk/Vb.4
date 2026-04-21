@@ -1,0 +1,5 @@
+{
+  "name": "v4 applechAI - PDF Intelligence",
+  "description": "Enterprise-grade document extraction pipeline leveraging Adobe PDF Services and Gemini AI for advanced semantic analysis and financial export.",
+  "requestFramePermissions": []
+}
