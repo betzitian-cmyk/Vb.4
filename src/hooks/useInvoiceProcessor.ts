@@ -36,7 +36,11 @@ export function useInvoiceProcessor() {
     formData.append("file", file);
     
     try {
-      const res = await fetch("/api/extract", { method: "POST", body: formData });
+      const res = await fetch("/api/extract", { 
+        method: "POST", 
+        body: formData,
+        credentials: "include" // Ensure session cookies are sent in iframe
+      });
       
       const contentType = res.headers.get("content-type");
       if (!res.ok) {
@@ -45,6 +49,9 @@ export function useInvoiceProcessor() {
           throw new Error(errorData.error || `Server error (${res.status})`);
         } else {
           const text = await res.text();
+          if (text.includes("Cookie check") || text.includes("redirectToReturnUrl")) {
+            throw new Error("Session expired or cookies blocked. Please open this app in a new tab to re-authenticate.");
+          }
           console.error("Non-JSON Error Response:", text);
           throw new Error(`Server returned HTML/Text (${res.status}). This usually indicates a timeout or proxy error.`);
         }
@@ -52,15 +59,17 @@ export function useInvoiceProcessor() {
 
       if (contentType && !contentType.includes("application/json")) {
         const text = await res.text();
+        if (text.includes("Cookie check") || text.includes("redirectToReturnUrl")) {
+          throw new Error("Session expired or cookies blocked. Please open this app in a new tab to re-authenticate.");
+        }
         console.error("Unexpected non-JSON success response:", text);
-        throw new Error("Server returned HTML instead of JSON. The document might be too complex for a single pass.");
+        throw new Error("Server returned HTML instead of JSON. This often happens due to an environment session timeout.");
       }
 
       return await res.json();
     } catch (err: any) {
-      // If it's a Fetch SyntaxError (JSON parse failed), provide context
       if (err.name === "SyntaxError") {
-        throw new Error(`Step 1 (Adobe): Response was not valid JSON. The server likely timed out or encountered a gateway error.`);
+        throw new Error(`Step 1 (Adobe): Response was not valid JSON. The server likely timed out or encountered a session error.`);
       }
       throw new Error(`Step 1 (Adobe): ${err.message}`);
     }

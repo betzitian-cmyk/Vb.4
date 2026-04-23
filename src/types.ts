@@ -39,8 +39,6 @@ export interface TaxBreakdown {
   rst?: number;
 }
 
-export type TaxabilityGroup = "Taxable" | "Zero-Rated" | "Exempt";
-
 export interface LineItem {
   description: string;
   quantity?: number;
@@ -48,7 +46,6 @@ export interface LineItem {
   amount?: number;
   tax?: number;
   isTaxExempt?: boolean;
-  taxabilityGroup?: TaxabilityGroup;
   taxBreakdown?: TaxBreakdown;
   taxRate?: number;
 }
@@ -74,7 +71,6 @@ export interface ParsedInvoice {
   taxGroup?: string;
   total?: number;
   currency?: string;
-  summary?: string;
   cached?: boolean;
 }
 

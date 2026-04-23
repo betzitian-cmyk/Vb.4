@@ -255,6 +255,42 @@ async function startServer() {
     }
   });
 
+  // --- QST VALIDATION API ---
+  app.get("/api/validate-qst/:qstNumber", async (req, res) => {
+    const { qstNumber } = req.params;
+    try {
+      const response = await fetch(`https://svcnab2b.revenuquebec.ca/2019/02/ValidationTVQ/${qstNumber}`);
+      
+      if (response.status === 404) {
+        return res.json({ status: "NOT_FOUND", message: "Not a QST registration number" });
+      }
+      if (response.status === 400) {
+        return res.json({ status: "INVALID_FORMAT", message: "Invalid QST number format" });
+      }
+      if (!response.ok) {
+        return res.status(response.status).json({ error: "Revenü Québec service unavailable" });
+      }
+
+      const data: any = await response.json();
+      const result = data.Resultat;
+
+      if (result) {
+        res.json({
+          status: result.StatutSousDossierUsager === "R" ? "ACTIVE" : "REVOKED",
+          description: result.DescriptionStatut,
+          effectiveDate: result.DateStatut,
+          legalName: result.NomEntreprise,
+          commercialName: result.RaisonSociale
+        });
+      } else {
+        res.status(500).json({ error: "Unexpected response format from Revenü Québec" });
+      }
+    } catch (error) {
+      console.error("QST Validation Error:", error);
+      res.status(500).json({ error: "Internal validation failure" });
+    }
+  });
+
   // Serve Frontend
   const distPath = path.join(process.cwd(), "dist");
   if (process.env.NODE_ENV === "production" && fs.existsSync(distPath)) {

@@ -1,5 +1,5 @@
 import React from "react";
-import { Brain, AlertCircle, Copy, Check, Zap, ReceiptText, ShieldAlert } from "lucide-react";
+import { Brain, AlertCircle, Copy, Check, Zap, ReceiptText, ShieldAlert, Search, ShieldCheck, ShieldX, RefreshCw, Database, ExternalLink, Activity } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { ParsedInvoice, ExtractionResult, LineItem } from "../types";
 import { calculateTaxDiscrepancy } from "../lib/invoiceUtils";
@@ -15,9 +15,19 @@ interface ResultDetailProps {
   viewMode: "ui" | "parsed" | "raw";
 }
 
+interface ValidationStatus {
+  status: "IDLE" | "LOADING" | "ACTIVE" | "REVOKED" | "NOT_FOUND" | "INVALID_FORMAT" | "ERROR";
+  legalName?: string;
+  message?: string;
+}
+
 export const ResultDetail: React.FC<ResultDetailProps> = ({ item, viewMode }) => {
   const { parsedInvoice, rawResult, status, error, progress } = item;
   const [copied, setCopied] = React.useState(false);
+  const [autoVerify, setAutoVerify] = React.useState(true);
+  
+  const [qstStatus, setQstStatus] = React.useState<ValidationStatus>({ status: "IDLE" });
+  const [gstStatus, setGstStatus] = React.useState<ValidationStatus>({ status: "IDLE" });
 
   const handleCopy = () => {
     const text = JSON.stringify(viewMode === "raw" ? rawResult : parsedInvoice, null, 2);
@@ -25,6 +35,74 @@ export const ResultDetail: React.FC<ResultDetailProps> = ({ item, viewMode }) =>
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
+
+  const validateQST = async (qst: string) => {
+    if (!qst) return;
+    
+    // Normalize: Extract 10 digits and reconstruct as XXXXXXXXXXTQ0001
+    // As per RQ technical specs, the QST identifier is 10 digits.
+    const digits = qst.replace(/\D/g, "").slice(0, 10);
+    if (digits.length !== 10) {
+      setQstStatus({ status: "INVALID_FORMAT", message: "QST requires exactly 10 digits" });
+      return;
+    }
+    const normalizedQst = `${digits}TQ0001`;
+
+    setQstStatus({ status: "LOADING" });
+    try {
+      const response = await fetch(`/api/validate-qst/${normalizedQst}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      setQstStatus(data);
+    } catch (err: any) {
+      setQstStatus({ status: "ERROR", message: err.message });
+    }
+  };
+
+  const validateGST = async (gst: string) => {
+    if (!gst) return;
+
+    // Normalize: Extract 9 digits (Business Number) and reconstruct as XXXXXXXXXRT0001
+    const digits = gst.replace(/\D/g, "").slice(0, 9);
+    if (digits.length !== 9) {
+      setGstStatus({ status: "INVALID_FORMAT", message: "GST/HST requires a 9-digit Business Number" });
+      return;
+    }
+    const normalizedGst = `${digits}RT0001`;
+
+    setGstStatus({ status: "LOADING" });
+    // Note: Official CRA API requires complex params. 
+    // We implement a format check + registry link for now as per search limits.
+    setTimeout(() => {
+      setGstStatus({ 
+        status: "IDLE", 
+        message: `Validated structure: ${normalizedGst}` 
+      });
+    }, 800);
+  };
+
+  // 1. Reset state when changing invoices
+  React.useEffect(() => {
+    setQstStatus({ status: "IDLE" });
+    setGstStatus({ status: "IDLE" });
+  }, [parsedInvoice?.invoiceNumber]);
+
+  // 2. Automated trigger based on toggle and available data
+  React.useEffect(() => {
+    if (!autoVerify || !parsedInvoice) return;
+    
+    // Capture values to prevent closure issues
+    const qstNum = parsedInvoice.vendorTaxNumbers?.qst;
+    const gstNum = parsedInvoice.vendorTaxNumbers?.gstHst;
+    const isQC = parsedInvoice.province === "QC";
+
+    const triggerValidation = async () => {
+      if (isQC && qstNum) await validateQST(qstNum);
+      if (gstNum) await validateGST(gstNum);
+    };
+
+    triggerValidation();
+  }, [parsedInvoice?.invoiceNumber, autoVerify]);
 
   if (status === "processing") return <LoadingState progress={progress} />;
   if (status === "error") return <ErrorState error={error} />;
@@ -35,16 +113,30 @@ export const ResultDetail: React.FC<ResultDetailProps> = ({ item, viewMode }) =>
       <motion.div 
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
-        className="space-y-12"
+        className="space-y-12 pb-24"
       >
         <CacheHitBadge show={!!parsedInvoice.cached} />
+        
         <section className="space-y-6">
           <SectionHeader icon={<Zap className="w-5 h-5" />} title="Operational Overview" />
-          <StatGrid invoice={parsedInvoice} />
+          <StatGrid invoice={parsedInvoice} qstValidation={qstStatus} gstValidation={gstStatus} />
         </section>
 
         <section className="space-y-6">
-          <SectionHeader icon={<Brain className="w-5 h-5 text-orange-500" />} title="Semantic Analysis" />
+          <SectionHeader icon={<Activity className="w-5 h-5 text-blue-500" />} title="Tax Compliance Verification" />
+          <ComplianceBoard 
+            invoice={parsedInvoice} 
+            qstStatus={qstStatus} 
+            gstStatus={gstStatus}
+            onValidateQST={() => parsedInvoice.vendorTaxNumbers?.qst && validateQST(parsedInvoice.vendorTaxNumbers.qst)}
+            onValidateGST={() => parsedInvoice.vendorTaxNumbers?.gstHst && validateGST(parsedInvoice.vendorTaxNumbers.gstHst)}
+            autoVerify={autoVerify}
+            onToggleAuto={() => setAutoVerify(!autoVerify)}
+          />
+        </section>
+
+        <section className="space-y-6">
+          <SectionHeader icon={<Brain className="w-5 h-5 text-orange-500" />} title="Fiscal Analysis" />
           <TaxAnalysis invoice={parsedInvoice} />
         </section>
 
@@ -142,25 +234,211 @@ const EmptyState = () => (
   </div>
 );
 
-const StatItem = ({ label, value, mono = true }: { label: string, value?: string, mono?: boolean }) => (
+const StatItem = ({ label, value, mono = true, extra }: { label: string, value?: string, mono?: boolean, extra?: React.ReactNode }) => (
   <div className="bg-white p-6 transition-all hover:bg-gray-50/50 group border border-transparent hover:border-gray-100 rounded-[1.5rem]">
-    <p className="text-[10px] uppercase font-black text-gray-300 tracking-widest mb-3 group-hover:text-gray-400 transition-colors">{label}</p>
+    <div className="flex justify-between items-start mb-3">
+      <p className="text-[10px] uppercase font-black text-gray-300 tracking-widest group-hover:text-gray-400 transition-colors">{label}</p>
+      {extra}
+    </div>
     <p className={`font-bold text-gray-950 truncate leading-none ${mono ? 'font-mono text-sm tracking-tight' : 'text-base font-black'}`}>
       {value || "—"}
     </p>
   </div>
 );
 
-const StatGrid = ({ invoice }: { invoice: ParsedInvoice }) => (
-  <div className="grid grid-cols-2 lg:grid-cols-4 gap-1 p-1 bg-gray-50/50 rounded-[2.5rem] border border-gray-100 overflow-hidden shadow-sm">
-    <StatItem label="Stream ID" value={invoice.invoiceNumber} />
-    <StatItem label="Vendor" value={invoice.vendorName} mono={false} />
-    <StatItem label="Process Date" value={invoice.date} />
-    <StatItem label="Total Exposure" value={`${invoice.currency || ""} ${invoice.total?.toFixed(2) || "0.00"}`} />
-    <StatItem label="Jurisdiction" value={invoice.province} />
-    <StatItem label="BN/Business #" value={invoice.vendorTaxNumbers?.businessNumber} />
-    <StatItem label="GST/HST Reg" value={invoice.vendorTaxNumbers?.gstHst} />
-    <StatItem label="QST Reg" value={invoice.vendorTaxNumbers?.qst} />
+const StatGrid = ({ invoice, qstValidation, gstValidation }: { invoice: ParsedInvoice, qstValidation?: ValidationStatus, gstValidation?: ValidationStatus }) => {
+  const renderStatus = (valStatus?: ValidationStatus) => {
+    if (!valStatus || valStatus.status === "IDLE") return null;
+    
+    switch (valStatus.status) {
+      case "LOADING":
+        return <div className="w-2 h-2 bg-blue-400 rounded-full animate-pulse" />;
+      case "ACTIVE":
+        return <ShieldCheck className="w-3 h-3 text-green-500" />;
+      case "REVOKED":
+        return <ShieldX className="w-3 h-3 text-red-500" />;
+      case "INVALID_FORMAT":
+      case "NOT_FOUND":
+        return <ShieldAlert className="w-3 h-3 text-orange-400" />;
+      case "ERROR":
+        return <AlertCircle className="w-3 h-3 text-gray-400" />;
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-2 lg:grid-cols-4 gap-1 p-1 bg-gray-50/50 rounded-[2.5rem] border border-gray-100 overflow-hidden shadow-sm">
+      <StatItem label="Stream ID" value={invoice.invoiceNumber} />
+      <StatItem label="PO Tracking" value={invoice.poNumber} />
+      <StatItem label="Vendor" value={invoice.vendorName} mono={false} />
+      <StatItem label="Total Exposure" value={`${invoice.currency || ""} ${invoice.total?.toFixed(2) || "0.00"}`} />
+      <StatItem label="Process Date" value={invoice.date} />
+      <StatItem label="Payment Due" value={invoice.dueDate} />
+      <StatItem label="Jurisdiction" value={invoice.province} />
+      <StatItem label="BN/Business #" value={invoice.vendorTaxNumbers?.businessNumber} />
+      <StatItem label="GST/HST Reg" value={invoice.vendorTaxNumbers?.gstHst} extra={renderStatus(gstValidation)} />
+      <StatItem label="QST Reg" value={invoice.vendorTaxNumbers?.qst} extra={renderStatus(qstValidation)} />
+    </div>
+  );
+};
+
+const ComplianceBoard = ({ 
+  invoice, 
+  qstStatus, 
+  gstStatus, 
+  onValidateQST, 
+  onValidateGST,
+  autoVerify,
+  onToggleAuto
+}: { 
+  invoice: ParsedInvoice, 
+  qstStatus: ValidationStatus, 
+  gstStatus: ValidationStatus,
+  onValidateQST: () => void,
+  onValidateGST: () => void,
+  autoVerify: boolean,
+  onToggleAuto: () => void
+}) => (
+  <div className="bg-white border border-gray-100 rounded-[2.5rem] p-8 shadow-sm space-y-8">
+    <div className="flex justify-between items-center">
+      <div>
+        <h4 className="text-lg font-black text-gray-900">Registration Verification</h4>
+        <p className="text-xs text-gray-400 font-medium mt-1">Cross-referencing tax IDs with official government registries.</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <span className="text-[10px] font-black uppercase text-gray-300">Auto-Verification</span>
+        <button 
+          onClick={onToggleAuto}
+          className={`w-12 h-6 rounded-full transition-colors relative ${autoVerify ? 'bg-orange-500' : 'bg-gray-200'}`}
+        >
+          <motion.div 
+            animate={{ x: autoVerify ? 26 : 4 }}
+            className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+          />
+        </button>
+      </div>
+    </div>
+
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      {/* QST CHECK */}
+      <div className={`p-6 rounded-3xl border transition-all ${qstStatus.status === 'ACTIVE' ? 'bg-green-50/20 border-green-100' : 'bg-gray-50/50 border-gray-100'}`}>
+        <div className="flex justify-between items-start mb-4">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-white rounded-xl shadow-sm border border-gray-50">
+              <Database className="w-4 h-4 text-blue-500" />
+            </div>
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-widest text-gray-400">Revenü Québec Registry</p>
+              <p className="text-sm font-black text-gray-900">QST: {invoice.vendorTaxNumbers?.qst || "Missing"}</p>
+            </div>
+          </div>
+          <button 
+            disabled={!invoice.vendorTaxNumbers?.qst || qstStatus.status === 'LOADING'}
+            onClick={onValidateQST}
+            className="p-2 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-30"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${qstStatus.status === 'LOADING' ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
+
+        {qstStatus.status === 'IDLE' && <p className="text-[11px] text-gray-400 font-medium italic">Ready for verification</p>}
+        {qstStatus.status === 'LOADING' && <p className="text-[11px] text-blue-500 font-bold animate-pulse">Connecting to provincial API...</p>}
+        {qstStatus.status === 'ACTIVE' && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-green-600 font-black text-xs">
+              <ShieldCheck className="w-4 h-4" /> VERIFIED ACTIVE
+            </div>
+            <p className="text-[12px] font-bold text-gray-950 uppercase">{qstStatus.legalName}</p>
+          </div>
+        )}
+        {qstStatus.status === 'REVOKED' && (
+          <div className="flex items-center gap-2 text-red-600 font-black text-xs">
+            <ShieldX className="w-4 h-4" /> REGISTRATION REVOKED
+          </div>
+        )}
+        {(qstStatus.status === 'NOT_FOUND' || qstStatus.status === 'INVALID_FORMAT') && (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-orange-600 font-black text-xs">
+              <ShieldAlert className="w-4 h-4" /> {qstStatus.message || "Identification Failed"}
+            </div>
+            <a 
+              href="https://www.revenuquebec.ca/en/online-services/online-services/validate-a-qst-registration-number/" 
+              target="_blank"
+              className="inline-flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-blue-500 hover:text-blue-600 transition-colors"
+            >
+              Manual RQ Check <ExternalLink className="w-3 h-3" />
+            </a>
+          </div>
+        )}
+      </div>
+
+      {/* GST CHECK */}
+      <div className={`p-6 rounded-3xl border transition-all ${gstStatus.status === 'INVALID_FORMAT' ? 'bg-red-50/20 border-red-100' : 'bg-gray-50/50 border-gray-100'}`}>
+        <div className="flex justify-between items-start mb-4">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-white rounded-xl shadow-sm border border-gray-50">
+              <Database className="w-4 h-4 text-red-500" />
+            </div>
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-widest text-gray-400">CRA Federal Registry</p>
+              <p className="text-sm font-black text-gray-900">GST/HST: {invoice.vendorTaxNumbers?.gstHst || "Missing"}</p>
+            </div>
+          </div>
+          <button 
+            disabled={!invoice.vendorTaxNumbers?.gstHst || gstStatus.status === 'LOADING'}
+            onClick={onValidateGST}
+            className="p-2 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-30"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${gstStatus.status === 'LOADING' ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
+
+        <div className="space-y-3">
+          {gstStatus.status === 'INVALID_FORMAT' ? (
+            <p className="text-[11px] text-red-500 font-medium whitespace-nowrap overflow-hidden text-ellipsis">Structure error: Expected 9-digit BN + RTXXXX</p>
+          ) : (
+             <p className="text-[11px] text-gray-500 font-medium leading-relaxed">
+              Name/Date matching required for CRA verification.
+            </p>
+          )}
+          <a 
+            href="https://www.canada.ca/en/revenue-agency/services/tax/businesses/topics/gst-hst-businesses/gst-hst-registry-verify-a-gst-hst-number.html" 
+            target="_blank"
+            className="inline-flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-orange-500 hover:text-orange-600 transition-colors"
+          >
+            Open Registry <ExternalLink className="w-3 h-3" />
+          </a>
+        </div>
+      </div>
+
+      {/* PROVINCIAL PST CHECK */}
+      {["BC", "SK", "MB"].includes(invoice.province || "") && (
+        <div className="p-6 rounded-3xl border bg-gray-50/50 border-gray-100">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="p-2 bg-white rounded-xl shadow-sm border border-gray-50">
+              <Database className="w-4 h-4 text-gray-500" />
+            </div>
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-widest text-gray-400">{invoice.province} PST Registry</p>
+              <p className="text-sm font-black text-gray-900">PST: {invoice.vendorTaxNumbers?.pst || invoice.vendorTaxNumbers?.rst || "Missing"}</p>
+            </div>
+          </div>
+          <p className="text-[11px] text-gray-500 font-medium mb-3">Verification required via provincial portal.</p>
+          <a 
+            href={
+              invoice.province === "BC" ? "https://www.etax.gov.bc.ca/btp/pstw/_/" :
+              invoice.province === "SK" ? "https://sets.saskatchewan.ca/pub/pst-verification" :
+              "https://tax-services.gov.mb.ca/tax-verification/"
+            }
+            target="_blank"
+            className="inline-flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-orange-500 hover:text-orange-600 transition-colors"
+          >
+            Provincial portal <ExternalLink className="w-3 h-3" />
+          </a>
+        </div>
+      )}
+    </div>
   </div>
 );
 
@@ -204,18 +482,6 @@ const TaxAnalysis = ({ invoice }: { invoice: ParsedInvoice }) => {
           )}
         </AnimatePresence>
       </div>
-
-      <div className="lg:col-span-12 p-8 bg-black rounded-[2.5rem] flex gap-6 items-start shadow-2xl shadow-gray-200 border border-gray-900">
-        <div className="w-14 h-14 bg-white/5 rounded-2xl flex items-center justify-center shadow-inner shrink-0 border border-white/5">
-          <Brain className="w-7 h-7 text-orange-500" />
-        </div>
-        <div className="space-y-2">
-          <p className="text-[10px] font-black uppercase tracking-[0.25em] text-orange-500/80">LLM Intent Deciphered</p>
-          <p className="text-base text-gray-300 italic font-serif leading-relaxed pr-10">
-            {invoice.summary || "Extracting high-precision semantic meaning from OCR-less layout trees and visual document features..."}
-          </p>
-        </div>
-      </div>
     </div>
   );
 };
@@ -241,8 +507,8 @@ const LineItemsTable = ({ invoice }: { invoice: ParsedInvoice }) => (
       <thead className="bg-gray-50/30 border-b border-gray-50">
         <tr>
           <th className="px-8 py-6 font-black text-gray-400 text-[10px] uppercase tracking-[0.2em]">Description</th>
-          <th className="px-8 py-6 font-black text-gray-400 text-[10px] uppercase tracking-[0.2em] text-center">ML Group</th>
           <th className="px-8 py-6 font-black text-gray-400 text-[10px] uppercase tracking-[0.2em] text-right">Qty</th>
+          <th className="px-8 py-6 font-black text-gray-400 text-[10px] uppercase tracking-[0.2em] text-right">Unit Price</th>
           <th className="px-8 py-6 font-black text-gray-400 text-[10px] uppercase tracking-[0.2em] text-right">Base</th>
           <th className="px-8 py-6 font-black text-gray-400 text-[10px] uppercase tracking-[0.2em] text-right">Tax</th>
         </tr>
@@ -252,18 +518,16 @@ const LineItemsTable = ({ invoice }: { invoice: ParsedInvoice }) => (
           <tr key={idx} className="hover:bg-gray-50/20 transition-all group">
             <td className="px-8 py-6">
               <p className="font-bold text-gray-900 tracking-tight leading-tight">{item.description}</p>
-            </td>
-            <td className="px-8 py-6 text-center">
-              <span className={`inline-block px-3 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-widest border transition-colors ${
-                item.taxabilityGroup === "Taxable" ? "bg-green-50 text-green-700 border-green-100 group-hover:bg-green-100" :
-                item.taxabilityGroup === "Zero-Rated" ? "bg-blue-50 text-blue-700 border-blue-100 group-hover:bg-blue-100" :
-                item.taxabilityGroup === "Exempt" ? "bg-gray-50 text-gray-500 border-gray-100 group-hover:bg-gray-100" :
-                "bg-gray-50 text-gray-400 border-gray-100 opacity-50"
-              }`}>
-                {item.taxabilityGroup || "Undef"}
-              </span>
+              {item.isTaxExempt && (
+                <span className="inline-block mt-1 px-2 py-0.5 rounded-lg text-[7px] font-black uppercase tracking-widest bg-gray-100 text-gray-500 border border-gray-200">
+                  Exempt
+                </span>
+              )}
             </td>
             <td className="px-8 py-6 text-right text-gray-400 font-mono font-bold">{item.quantity || "1"}</td>
+            <td className="px-8 py-6 text-right font-black text-gray-950 font-mono tracking-tighter">
+              ${item.unitPrice?.toFixed(2) || "0.00"}
+            </td>
             <td className="px-8 py-6 text-right font-black text-gray-950 font-mono tracking-tighter">${item.amount?.toFixed(2) || "0.00"}</td>
             <td className="px-8 py-6 text-right group-hover:bg-gray-50/20 min-w-[120px]">
               <p className="font-black text-gray-950 font-mono text-sm tracking-tighter">${item.tax?.toFixed(2) || "0.00"}</p>
