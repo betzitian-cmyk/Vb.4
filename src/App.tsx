@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { FileText, Download, Fingerprint, Activity, Layers, ArrowRight } from "lucide-react";
+import { FileText, Download, Fingerprint, Activity, Layers, ArrowRight, ShieldAlert, ExternalLink } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { UploadZone } from "./components/UploadZone";
 import { ProcessingQueue } from "./components/ProcessingQueue";
@@ -23,6 +23,7 @@ export default function App() {
   } = useInvoiceProcessor();
 
   const selectedItem = queue.find(i => i.id === selectedId);
+  const isIframe = window.self !== window.top;
 
   const handleFilesSelection = (files: File[]) => {
     const newItems = addFiles(files);
@@ -74,6 +75,28 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-8 pt-32 pb-24">
+        {isIframe && (
+          <motion.div 
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-8 p-4 bg-orange-50 border border-orange-100 rounded-3xl flex items-center justify-between gap-4"
+          >
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-white rounded-xl shadow-sm text-orange-500">
+                <ShieldAlert className="w-5 h-5" />
+              </div>
+              <p className="text-xs font-bold text-orange-900 leading-relaxed">
+                App running in Preview Frame. If you encounter session errors, please open the app in a new tab to bypass cookie restrictions.
+              </p>
+            </div>
+            <button 
+              onClick={() => window.open(window.location.href, '_blank')}
+              className="px-5 py-2.5 bg-orange-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-orange-600 transition-all shadow-lg shadow-orange-200 shrink-0"
+            >
+              Open New Tab
+            </button>
+          </motion.div>
+        )}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-start">
           
           {/* Dashboard Left: Inputs */}

@@ -212,20 +212,38 @@ const LoadingState = ({ progress }: { progress?: number }) => (
     </div>
     <div className="space-y-3 text-center">
       <h3 className="text-2xl font-black text-gray-950 tracking-tight">Extracting Nuance</h3>
-      <p className="text-sm text-gray-400 font-medium max-w-sm mx-auto leading-relaxed">Cross-referencing Adobe structural nodes with Gemini semantic reasoning models.</p>
+      <p className="text-sm text-gray-400 font-medium max-w-sm mx-auto leading-relaxed">Cross-referencing Adobe structural nodes with OpenRouter semantic reasoning models.</p>
     </div>
   </div>
 );
 
-const ErrorState = ({ error }: { error?: string }) => (
-  <div className="h-full flex flex-col items-center justify-center py-24 text-center px-10">
-    <div className="w-24 h-24 bg-red-50 rounded-[2rem] flex items-center justify-center mb-8 rotate-3 shadow-xl shadow-red-100/30 border border-red-100">
-      <AlertCircle className="w-12 h-12 text-red-500" />
+const ErrorState = ({ error }: { error?: string }) => {
+  const isSessionError = error?.includes("Session expired") || error?.includes("cookies blocked");
+  
+  return (
+    <div className="h-full flex flex-col items-center justify-center py-24 text-center px-10">
+      <div className={`w-24 h-24 rounded-[2rem] flex items-center justify-center mb-8 rotate-3 shadow-xl border ${isSessionError ? 'bg-orange-50 border-orange-100 shadow-orange-100/30' : 'bg-red-50 border-red-100 shadow-red-100/30'}`}>
+        {isSessionError ? <ShieldAlert className="w-12 h-12 text-orange-500" /> : <AlertCircle className="w-12 h-12 text-red-500" />}
+      </div>
+      <h3 className="text-2xl font-black text-gray-950 mb-3 tracking-tight">
+        {isSessionError ? 'Authentication Required' : 'Pipeline Fault'}
+      </h3>
+      <p className="text-sm text-gray-500 max-w-sm leading-relaxed font-medium mb-8">
+        {error || "An unauthorized intercept or data corruption occurred."}
+      </p>
+      
+      {isSessionError && (
+        <button 
+          onClick={() => window.open(window.location.href, '_blank')}
+          className="flex items-center gap-3 px-8 py-4 bg-orange-500 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-orange-600 transition-all shadow-lg shadow-orange-200"
+        >
+          <ExternalLink className="w-4 h-4" />
+          Authenticate in New Tab
+        </button>
+      )}
     </div>
-    <h3 className="text-2xl font-black text-gray-950 mb-3 tracking-tight">Pipeline Fault</h3>
-    <p className="text-sm text-gray-500 max-w-sm leading-relaxed font-medium">{error || "An unauthorized intercept or data corruption occurred."}</p>
-  </div>
-);
+  );
+};
 
 const EmptyState = () => (
   <div className="h-full flex flex-col items-center justify-center py-32 text-gray-300">

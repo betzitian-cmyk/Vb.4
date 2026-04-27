@@ -168,35 +168,36 @@ const parseWithAI = async (payload: AIParsePayload) => {
     });
   }
 
+  // OpenRouter implementation following OpenAI-compatible standard
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      "HTTP-Referer": process.env.APP_URL || "http://localhost:3000",
-      "X-Title": "applechAI"
+      "HTTP-Referer": process.env.APP_URL || "https://ai.studio/build",
+      "X-Title": "ApplechAI"
     },
     body: JSON.stringify({
-      model: "google/gemini-2.0-flash-001",
+      model: "openrouter/free",
       messages,
       response_format: { type: "json_object" },
-      temperature: 0.1 // Low temperature for high precision extraction
+      temperature: 0.1
     })
   });
 
   if (!response.ok) {
     const errorBody = await response.json().catch(() => ({}));
-    throw new Error(`AI API error: ${response.status} ${errorBody.error?.message || response.statusText}`);
+    throw new Error(`OpenRouter API error: ${response.status} ${errorBody.error?.message || response.statusText}`);
   }
 
   const data = await response.json();
   const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("The AI model returned an empty response.");
+  if (!content) throw new Error("The AI service returned an empty response.");
 
   try {
     return JSON.parse(content);
   } catch (e) {
-    // Fallback cleaning if JSON is wrapped in markdown
+    // Fallback: Cleaning markdown wrappers if the model ignores the json_object format
     const cleaned = content.replace(/```json\s*([\s\S]*?)\s*```/g, "$1").trim();
     return JSON.parse(cleaned);
   }
