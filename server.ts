@@ -1,316 +1,277 @@
-import "dotenv/config";
-import express from "express";
-import { createServer as createViteServer } from "vite";
-import path from "path";
-import multer from "multer";
-import fs from "fs";
-import AdmZip from "adm-zip";
-import os from "os";
-import crypto from "crypto";
-import { fileURLToPath } from "url";
-import { LRUCache } from "lru-cache";
-import {
-  ServicePrincipalCredentials,
-  PDFServices,
-  ExtractElementType,
-  ExtractPDFParams,
-  ExtractRenditionsElementType,
-  ExtractPDFJob,
-  ExtractPDFResult,
-  CreatePDFJob,
-  CreatePDFResult,
-  ServiceUsageError,
-  MimeType
-} from "@adobe/pdfservices-node-sdk";
-
-// --- ESM REPLACEMENTS ---
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// --- TYPES ---
-interface AdobeExtraction {
-  elements: any[];
-  [key: string]: any;
+// --- TYPES FOR INVOICE EXTRACTION ---
+interface LineItem {
+  description: string;
+  quantity: number;
+  unitPrice: number | null;
+  amount: number;
+  tax: number;
+  isTaxExempt: boolean;
+  taxRate: number | null;
+  taxBreakdown: string | null;
 }
 
-interface AIParsePayload {
-  adobeData?: any[];
-  imageData?: {
-    mimetype: string;
-    data: string;
-  };
-  systemInstruction: string;
-  prompt: string;
+interface ParsedInvoice {
+  invoiceNumber: string | null;
+  date: string | null;
+  vendorName: string | null;
+  items: LineItem[];
+  subtotal: number;
+  tax: number;
+  total: number;
+  province: string | null;
+  taxGroup: string | null;
 }
 
-// --- CONFIGURATION ---
-const PORT = 3000;
-const uploadDir = path.join(__dirname, "uploads/tmp");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
-});
-
-// --- CACHING ---
-const extractionCache = new LRUCache<string, AdobeExtraction>({ max: 500 });
-const aiParseCache = new LRUCache<string, any>({ max: 1000 });
-
-// --- UTILS ---
-const getFileHash = (filePath: string): string => {
-  const buffer = fs.readFileSync(filePath);
-  return crypto.createHash("sha256").update(buffer).digest("hex");
+// --- CANADIAN TAX RATES ---
+const TAX_RATES: Record<string, any> = {
+  "ON": { name: "HST", type: "HST", total: 0.13, federal: 0.05 },
+  "BC": { name: "GST + PST", type: "GST/PST", total: 0.12, federal: 0.05 },
+  "AB": { name: "GST", type: "GST", total: 0.05, federal: 0.05 },
+  "MB": { name: "GST + PST", type: "GST/PST", total: 0.12, federal: 0.05 },
+  "SK": { name: "GST + PST", type: "GST/PST", total: 0.11, federal: 0.05 },
+  "QC": { name: "GST + QST", type: "GST/QST", total: 0.14975, federal: 0.05 },
+  "NB": { name: "HST", type: "HST", total: 0.15, federal: 0.05 },
+  "NS": { name: "HST", type: "HST", total: 0.15, federal: 0.05 },
+  "PE": { name: "HST", type: "HST", total: 0.15, federal: 0.05 },
+  "NL": { name: "HST", type: "HST", total: 0.15, federal: 0.05}
 };
 
-const getPayloadHash = (payload: AIParsePayload): string => {
-  return crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+const PROVINCE_MAPPING: Record<string, string> = {
+  "ONTARIO": "ON", "BRITISH COLUMBIA": "BC", "ALBERTA": "AB",
+  "MANITOBA": "MB", "SASKATCHEWAN": "SK", "QUEBEC": "QC",
+  "NEW BRUNSWICK": "NB", "NOVA SCOTIA": "NS", "PRINCE EDWARD ISLAND": "PE",
+  "NEWFOUNDLAND": "NL"
 };
 
-const streamToBuffer = async (stream: any): Promise<Buffer> => {
-  const chunks: Buffer[] = [];
-  if (typeof stream.on === "function") {
-    return new Promise((resolve, reject) => {
-      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
-      stream.on("end", () => resolve(Buffer.concat(chunks)));
-      stream.on("error", reject);
-    });
-  }
-  for await (const chunk of stream) {
-    chunks.push(Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
+// --- HELPERS ---
+const _normalizeProvinceCode = (code: string | null | undefined): string | null => {
+  if (!code) return null;
+  const upper = String(code).toUpperCase();
+  return Object.values(PROVINCE_MAPPING).includes(upper) ? upper : null;
 };
 
-// --- SERVICES ---
+const _isLikelyTaxExempt = (description: string): boolean => {
+  const exempt = ["medicine", "prescription", "food", "bread", "milk"];
+  return exempt.some(e => description.toLowerCase().includes(e));
+};
 
-let pdfServicesInstance: PDFServices | null = null;
-const getPdfServices = () => {
-  if (!pdfServicesInstance) {
-    if (!process.env.ADOBE_CLIENT_ID || !process.env.ADOBE_CLIENT_SECRET) {
-      throw new Error("Adobe PDF Services credentials not configured");
+const _isReducedRateItem = (description: string): boolean => {
+  const reduced = ["book", "newspaper", "medication"];
+  return reduced.some(r => description.toLowerCase().includes(r));
+};
+
+const _inferProvinceFromText = (text: string): string | null => {
+  if (!text) return null;
+  const t = text.toUpperCase();
+  for (const [name, code] of Object.entries(PROVINCE_MAPPING)) {
+    if (t.includes(name) || t.includes(code)) return code;
+  }
+  return null;
+};
+
+const _extractInvoiceNumber = (text: string): string | null => {
+  if (!text) return null;
+  const m = text.match(/(?:invoice\s*(?:no\.?|number|#)?\s*[:\-]?\s*)([A-Z0-9\-\/]+)/i);
+  return m ? m[1].trim() : null;
+};
+
+const _extractDate = (text: string): string | null => {
+  if (!text) return null;
+  const m = text.match(/\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b/);
+  return m ? m[1] : null;
+};
+
+const _computeTotalsFromLineItems = (lineItems: LineItem[], provinceCode: string | null): [number, number, number, string, string] => {
+  let subtotal = 0;
+  let taxTotal = 0;
+
+  const prov = provinceCode || "ON";
+  const rateInfo = TAX_RATES[prov] || TAX_RATES["ON"];
+  const taxGroup = rateInfo.name;
+
+  for (const it of lineItems) {
+    const amt = it.amount || 0;
+    subtotal += amt;
+
+    if (it.tax && it.tax !== 0) {
+      taxTotal += it.tax;
+    } else {
+      let rate = it.taxRate;
+      if (rate === null) {
+        rate = rateInfo.total;
+        if (rateInfo.type === "HST" && _isReducedRateItem(it.description)) {
+          rate = rateInfo.federal;
+        }
+      }
+      if (!_isLikelyTaxExempt(it.description)) {
+        taxTotal += amt * rate;
+      }
     }
-    const credentials = new ServicePrincipalCredentials({
-      clientId: process.env.ADOBE_CLIENT_ID!,
-      clientSecret: process.env.ADOBE_CLIENT_SECRET!,
-    });
-    pdfServicesInstance = new PDFServices({ credentials });
   }
-  return pdfServicesInstance;
+
+  subtotal = Math.round(subtotal * 100) / 100;
+  taxTotal = Math.round(taxTotal * 100) / 100;
+  const total = Math.round((subtotal + taxTotal) * 100) / 100;
+
+  return [subtotal, taxTotal, total, prov, taxGroup];
 };
 
-const extractPdfData = async (filePath: string, mimeType: string): Promise<AdobeExtraction> => {
-  const pdfServices = getPdfServices();
-  
-  let inputAsset = await pdfServices.upload({
-    readStream: fs.createReadStream(filePath),
-    mimeType: mimeType as MimeType,
-  });
+const _structuredToParsedInvoice = (structured: any): ParsedInvoice => {
+  const text = structured.text || "";
+  const lineItems = (structured.lineItems || []) as LineItem[];
 
-  // Image to PDF conversion if needed
-  if (mimeType.startsWith("image/")) {
-    const createJob = new CreatePDFJob({ inputAsset });
-    const pollingURL = await pdfServices.submit({ job: createJob });
-    const result = await pdfServices.getJobResult({ pollingURL, resultType: CreatePDFResult });
-    inputAsset = (result.result as any).asset || (result.result as any).resource;
+  let provHint = structured.provinceHint;
+  if (!provHint) {
+    provHint = _inferProvinceFromText(text);
   }
 
-  // Structural Extraction
-  const params = new ExtractPDFParams({ 
-    elementsToExtract: [ExtractElementType.TEXT, ExtractElementType.TABLES],
-    elementsToExtractRenditions: [ExtractRenditionsElementType.TABLES]
-  });
-  const extractJob = new ExtractPDFJob({ inputAsset, params });
-  const pollingURL = await pdfServices.submit({ job: extractJob });
-  const response = await pdfServices.getJobResult({ pollingURL, resultType: ExtractPDFResult });
+  const [subtotal, taxTotal, total, provCode, taxGroup] = _computeTotalsFromLineItems(lineItems, provHint);
 
-  const resultAsset = (response.result as any).resource || (response.result as any).asset;
-  const streamAsset = await pdfServices.getContent({ asset: resultAsset });
-  const zipBuffer = await streamToBuffer(streamAsset.readStream || streamAsset);
-  
-  const zip = new AdmZip(zipBuffer);
-  const jsonEntry = zip.getEntries().find(e => e.entryName === "structuredData.json");
-  if (!jsonEntry) throw new Error("Could not find structuredData.json in Adobe result zip");
-  
-  return JSON.parse(jsonEntry.getData().toString("utf8"));
+  let vendorName: string | null = null;
+  for (const ln of text.split("\n")) {
+    const trimmed = ln.trim();
+    if (trimmed) {
+      vendorName = trimmed;
+      break;
+    }
+  }
+
+  return {
+    invoiceNumber: _extractInvoiceNumber(text),
+    date: _extractDate(text),
+    vendorName,
+    items: lineItems,
+    subtotal,
+    tax: taxTotal,
+    total,
+    province: provCode,
+    taxGroup
+  };
 };
 
-const parseWithAI = async (payload: AIParsePayload) => {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY environment variable is missing");
+// --- EXTRACTION FUNCTIONS (STUBS FOR NOW) ---
+const extractWithDocling = async (filePath: string): Promise<any> => {
+  // TODO: Implement Docling extraction
+  return null;
+};
 
-  const { adobeData, imageData, systemInstruction, prompt } = payload;
-  
-  const messages: any[] = [{ role: "system", content: systemInstruction }];
-  
-  if (adobeData) {
-    messages.push({ 
-      role: "user", 
-      content: `${prompt}\n\n[DOCUMENT_DATA_START]\n${JSON.stringify(adobeData)}\n[DOCUMENT_DATA_END]` 
-    });
-  } else if (imageData) {
-    messages.push({
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: `data:${imageData.mimetype};base64,${imageData.data}` } }
-      ]
-    });
+const extractWithAdobePDFApi = async (filePath: string): Promise<any> => {
+  // Adobe is already available via extractPdfData
+  try {
+    return await extractPdfData(filePath, "application/pdf");
+  } catch (e) {
+    console.error("[Adobe Extract Error]", e);
+    return null;
+  }
+};
+
+const extractWithLamaParse = async (filePath: string): Promise<any> => {
+  // TODO: Implement LamaParse extraction
+  return null;
+};
+
+const extractWithLamaExtract = async (filePath: string): Promise<any> => {
+  // TODO: Implement LamaExtract extraction
+  return null;
+};
+
+// --- UNIFIED EXTRACTION PIPELINE ---
+const extractPdfWithFallbacks = async (filePath: string, provinceHint: string | null = null): Promise<any> => {
+  // 1) Docling
+  try {
+    const doclingResult = await extractWithDocling(filePath);
+    if (doclingResult && doclingResult.text) {
+      return {
+        ...doclingResult,
+        provinceHint: _normalizeProvinceCode(provinceHint),
+        _provider: "docling"
+      };
+    }
+  } catch (e) {
+    console.log("[Docling] Attempting Adobe...");
   }
 
-  // OpenRouter implementation following OpenAI-compatible standard
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": process.env.APP_URL || "https://ai.studio/build",
-      "X-Title": "ApplechAI"
-    },
-    body: JSON.stringify({
-      model: "openrouter/free",
-      messages,
-      response_format: { type: "json_object" },
-      temperature: 0.1
-    })
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.json().catch(() => ({}));
-    throw new Error(`OpenRouter API error: ${response.status} ${errorBody.error?.message || response.statusText}`);
+  // 2) Adobe PDF Extract
+  try {
+    const adobeResult = await extractWithAdobePDFApi(filePath);
+    if (adobeResult) {
+      return {
+        ...adobeResult,
+        provinceHint: _normalizeProvinceCode(provinceHint),
+        _provider: "adobe"
+      };
+    }
+  } catch (e) {
+    console.log("[Adobe] Attempting LamaParse...");
   }
 
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("The AI service returned an empty response.");
+  // 3) LamaParse
+  try {
+    const lamaParseResult = await extractWithLamaParse(filePath);
+    if (lamaParseResult) {
+      return {
+        ...lamaParseResult,
+        provinceHint: _normalizeProvinceCode(provinceHint),
+        _provider: "lamaparse"
+      };
+    }
+  } catch (e) {
+    console.log("[LamaParse] Attempting LamaExtract...");
+  }
+
+  // 4) LamaExtract
+  try {
+    const lamaExtractResult = await extractWithLamaExtract(filePath);
+    if (lamaExtractResult) {
+      return {
+        lineItems: lamaExtractResult.lineItems || [],
+        text: "",
+        objects: [],
+        pages: [],
+        tables: [],
+        provinceHint: _normalizeProvinceCode(provinceHint),
+        _provider: "lamaextract"
+      };
+    }
+  } catch (e) {
+    console.log("[LamaExtract] All extraction providers failed");
+  }
+
+  throw new Error("All extraction providers failed");
+};
+
+// --- NEW ENDPOINT: /api/extract-invoice ---
+app.post("/api/extract-invoice", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file was uploaded." });
+
+  const filePath = req.file.path;
+  const provinceHint = (req.body.province as string) || null;
 
   try {
-    return JSON.parse(content);
-  } catch (e) {
-    // Fallback: Cleaning markdown wrappers if the model ignores the json_object format
-    const cleaned = content.replace(/```json\s*([\s\S]*?)\s*```/g, "$1").trim();
-    return JSON.parse(cleaned);
+    const fileHash = getFileHash(filePath);
+    const cacheKey = `${fileHash}_invoice`;
+    
+    if (extractionCache.has(cacheKey)) {
+      return res.json({ ...extractionCache.get(cacheKey), cached: true });
+    }
+
+    // Run unified extraction pipeline
+    const structured = await extractPdfWithFallbacks(filePath, provinceHint);
+    
+    // Convert to parsed invoice format
+    const parsedInvoice = _structuredToParsedInvoice(structured);
+    
+    extractionCache.set(cacheKey, parsedInvoice);
+    res.json({ ...parsedInvoice, cached: false });
+
+  } catch (error: any) {
+    console.error("[Invoice Extraction Error]", error);
+    res.status(500).json({ error: error.message || "Failed to extract invoice." });
+  } finally {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlink(filePath, (err) => {
+        if (err) console.error(`[Cleanup Error] Failed to delete ${filePath}:`, err);
+      });
+    }
   }
-};
-
-// --- APP SETUP ---
-
-async function startServer() {
-  const app = express();
-  app.use(express.json({ limit: "10mb" }));
-
-  // API Routes
-  app.get("/api/health", (_, res) => res.json({ status: "ok", uptime: process.uptime() }));
-
-  app.post("/api/extract", upload.single("file"), async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: "No file was uploaded." });
-
-    const filePath = req.file.path;
-
-    try {
-      const fileHash = getFileHash(filePath);
-      if (extractionCache.has(fileHash)) {
-        return res.json({ ...extractionCache.get(fileHash), cached: true });
-      }
-
-      const data = await extractPdfData(filePath, req.file.mimetype);
-      extractionCache.set(fileHash, data);
-      res.json({ ...data, cached: false });
-    } catch (error: any) {
-      console.error("[Extraction Error]", error);
-      const statusCode = error instanceof ServiceUsageError ? 429 : 500;
-      res.status(statusCode).json({ error: error.message || "An error occurred during PDF extraction." });
-    } finally {
-      // Ensure file is deleted to keep container clean
-      if (filePath && fs.existsSync(filePath)) {
-        fs.unlink(filePath, (err) => {
-          if (err) console.error(`[Cleanup Error] Failed to delete ${filePath}:`, err);
-        });
-      }
-    }
-  });
-
-  app.post("/api/ai/parse", async (req, res) => {
-    const payloadHash = getPayloadHash(req.body);
-    if (aiParseCache.has(payloadHash)) {
-      return res.json({ ...aiParseCache.get(payloadHash), cached: true });
-    }
-
-    try {
-      const result = await parseWithAI(req.body);
-      aiParseCache.set(payloadHash, result);
-      res.json({ ...result, cached: false });
-    } catch (error: any) {
-      console.error("[AI Parse Error]", error);
-      res.status(500).json({ error: error.message || "An error occurred while the AI was analyzing the document." });
-    }
-  });
-
-  // --- QST VALIDATION API ---
-  app.get("/api/validate-qst/:qstNumber", async (req, res) => {
-    const { qstNumber } = req.params;
-    try {
-      const response = await fetch(`https://svcnab2b.revenuquebec.ca/2019/02/ValidationTVQ/${qstNumber}`);
-      
-      if (response.status === 404) {
-        return res.json({ status: "NOT_FOUND", message: "Not a QST registration number" });
-      }
-      if (response.status === 400) {
-        return res.json({ status: "INVALID_FORMAT", message: "Invalid QST number format" });
-      }
-      if (!response.ok) {
-        return res.status(response.status).json({ error: "Revenü Québec service unavailable" });
-      }
-
-      const data: any = await response.json();
-      const result = data.Resultat;
-
-      if (result) {
-        res.json({
-          status: result.StatutSousDossierUsager === "R" ? "ACTIVE" : "REVOKED",
-          description: result.DescriptionStatut,
-          effectiveDate: result.DateStatut,
-          legalName: result.NomEntreprise,
-          commercialName: result.RaisonSociale
-        });
-      } else {
-        res.status(500).json({ error: "Unexpected response format from Revenü Québec" });
-      }
-    } catch (error) {
-      console.error("QST Validation Error:", error);
-      res.status(500).json({ error: "Internal validation failure" });
-    }
-  });
-
-  // Serve Frontend
-  const distPath = path.join(process.cwd(), "dist");
-  if (process.env.NODE_ENV === "production" && fs.existsSync(distPath)) {
-    app.use(express.static(distPath));
-    app.get("*", (_, res) => res.sendFile(path.join(distPath, "index.html")));
-  } else {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
-    app.use(vite.middlewares);
-  }
-
-  // Global error handler
-  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    console.error("[Global Error Handled]", err);
-    res.status(err.status || 500).json({ error: err.message || "An unexpected system error occurred." });
-  });
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`\x1b[32m✔ Server running on http://localhost:${PORT}\x1b[0m`);
-  });
-}
-
-startServer();
+});
